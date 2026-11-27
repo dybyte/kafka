@@ -702,6 +702,98 @@ class ConsumerProtocolMigrationTest(cluster: ClusterInstance) extends GroupCoord
     )
   }
 
+  /**
+   * The test method checks the following scenario:
+   * 1. Creating a classic group with member 1. The group has as many members as group.max.size allows.
+   * 2. Static member 2 using consumer protocol joins. The group is upgraded and has two members.
+   * 3. A static member using classic protocol joins with the instance id of member 2 and replaces it.
+   *    All the members use classic protocol, but the group is not downgraded because it has more
+   *    members than group.max.size.
+   */
+  @ClusterTest(
+    serverProperties = Array(
+      new ClusterConfigProperty(key = GroupCoordinatorConfig.CONSUMER_GROUP_MIGRATION_POLICY_CONFIG, value = "bidirectional"),
+      new ClusterConfigProperty(key = GroupCoordinatorConfig.GROUP_MAX_SIZE_CONFIG, value = "1")
+    )
+  )
+  def testNoDowngradeWhenStaticMemberIsReplacedAndGroupSizeExceedsGroupMaxSize(): Unit = {
+    // Creates the __consumer_offsets topics because it won't be created automatically
+    // in this test because it does not use FindCoordinator API.
+    createOffsetsTopic()
+
+    // Create the topic.
+    createTopic(
+      topic = "foo",
+      numPartitions = 3
+    )
+
+    val groupId = "grp"
+    val instanceId = "instance-id"
+
+    // Classic member 1 joins the classic group, which is now as large as group.max.size allows.
+    val (memberId1, _) = joinDynamicConsumerGroupWithOldProtocol(
+      groupId = groupId,
+      metadata = metadata(List.empty),
+      assignment = assignment(List(0, 1, 2))
+    )
+
+    // Static member 2 using the consumer protocol joins. The group is upgraded to a consumer group,
+    // which is not limited by group.max.size, and has two members.
+    val memberId2 = Uuid.randomUuid.toString
+    var consumerGroupHeartbeatResponse = consumerGroupHeartbeat(
+      groupId = groupId,
+      memberId = memberId2,
+      instanceId = instanceId,
+      rebalanceTimeoutMs = 5 * 60 * 1000,
+      subscribedTopicNames = List("foo"),
+      topicPartitions = List.empty,
+      expectedError = Errors.NONE
+    )
+
+    // When assignor offload is enabled, the initial assignment is available in a later heartbeat.
+    if (isConsumerAssignorOffloadEnabled) {
+      TestUtils.waitUntilTrue(() => {
+        consumerGroupHeartbeatResponse = consumerGroupHeartbeat(
+          groupId = groupId,
+          memberId = memberId2,
+          memberEpoch = consumerGroupHeartbeatResponse.memberEpoch,
+          instanceId = instanceId,
+          expectedError = Errors.NONE
+        )
+        consumerGroupHeartbeatResponse.memberEpoch > 1
+      }, msg = s"Did not receive initial assignment. Last response $consumerGroupHeartbeatResponse.")
+    }
+
+    // Static member clients don't send explicit leave request when they are shutdown for
+    // downgrade, so member 2 is replaced by a new static member joining with old protocol
+    // and the same instance id.
+    val joinGroupResponseData = sendJoinRequest(
+      groupId = groupId,
+      groupInstanceId = instanceId,
+      metadata = metadata(List.empty)
+    )
+    assertEquals(Errors.NONE.code, joinGroupResponseData.errorCode)
+    val memberId3 = joinGroupResponseData.memberId
+
+    // The group is still a consumer group because it has more members than group.max.size.
+    assertEquals(
+      List((groupId, Group.GroupType.CONSUMER.toString)),
+      listGroups(
+        statesFilter = List.empty,
+        typesFilter = List.empty
+      ).map(group => (group.groupId, group.groupType))
+    )
+
+    // Member 2 has been replaced by member 3, so all the members use the classic protocol,
+    // i.e. their member type is 0.
+    assertEquals(
+      Map(memberId1 -> 0.toByte, memberId3 -> 0.toByte),
+      consumerGroupDescribe(List(groupId)).head.members.asScala.map { member =>
+        member.memberId -> member.memberType
+      }.toMap
+    )
+  }
+
   @ClusterTest(
     serverProperties = Array(
       new ClusterConfigProperty(key = GroupCoordinatorConfig.CONSUMER_GROUP_MIGRATION_POLICY_CONFIG, value = "disabled")
